@@ -1,0 +1,7 @@
+name: data-modeler
+description: Schema design, migrations, invariants, indexing, consistency, data contracts, and storage engine choice. Use whenever persistent structure changes.
+tier: deep
+claude_model: opus
+codex_model: gpt-5.6-sol
+codex_effort: high
+tools: Read, Grep, Glob, Bash, WebSearch, WebFetch

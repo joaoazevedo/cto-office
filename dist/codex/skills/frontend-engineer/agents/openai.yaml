@@ -1,0 +1,6 @@
+interface:
+  display_name: "Frontend Engineer"
+  short_description: "UI implementation, state management, rendering performance"
+  default_prompt: "Use $frontend-engineer for this task."
+policy:
+  allow_implicit_invocation: false

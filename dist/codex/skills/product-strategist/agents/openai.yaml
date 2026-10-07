@@ -1,0 +1,6 @@
+interface:
+  display_name: "Product Strategist"
+  short_description: "Market and competitor analysis, roadmap, prioritisation"
+  default_prompt: "Use $product-strategist for this task."
+policy:
+  allow_implicit_invocation: false

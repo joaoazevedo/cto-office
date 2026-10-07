@@ -1,0 +1,6 @@
+interface:
+  display_name: "Devops Engineer"
+  short_description: "Infrastructure, CI/CD, deployment, environments"
+  default_prompt: "Use $devops-engineer for this task."
+policy:
+  allow_implicit_invocation: false

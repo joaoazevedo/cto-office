@@ -1,0 +1,7 @@
+name: qa-engineer
+description: Test strategy, test authoring, regression risk, coverage gaps, and release readiness. Use when deciding what to test or whether something is safe to ship.
+tier: build
+claude_model: sonnet
+codex_model: gpt-5.6-sol
+codex_effort: medium
+tools: Read, Grep, Glob, Bash, Edit, Write, WebSearch, WebFetch

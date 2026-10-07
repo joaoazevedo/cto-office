@@ -1,0 +1,7 @@
+name: critic
+description: Red-teams a plan, design, or decision before it is committed to. Argues the opposing case and hunts for the failure the author cannot see. Use before commitment, not after.
+tier: deep
+claude_model: opus
+codex_model: gpt-5.6-sol
+codex_effort: high
+tools: Read, Grep, Glob, Bash, WebSearch, WebFetch

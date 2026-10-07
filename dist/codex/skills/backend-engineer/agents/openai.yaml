@@ -1,0 +1,6 @@
+interface:
+  display_name: "Backend Engineer"
+  short_description: "Service and API implementation, domain logic, background"
+  default_prompt: "Use $backend-engineer for this task."
+policy:
+  allow_implicit_invocation: false

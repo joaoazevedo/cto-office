@@ -1,0 +1,7 @@
+name: devops-engineer
+description: Infrastructure, CI/CD, deployment, environments, observability, cost, and runbooks. Use for anything that runs, deploys, or must be operated.
+tier: build
+claude_model: sonnet
+codex_model: gpt-5.6-sol
+codex_effort: medium
+tools: Read, Grep, Glob, Bash, Edit, Write, WebSearch, WebFetch

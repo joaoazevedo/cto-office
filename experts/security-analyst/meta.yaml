@@ -1,0 +1,7 @@
+name: security-analyst
+description: Threat modelling, authentication and authorization, secrets handling, data exposure, dependency risk, and compliance surface. Use on anything touching identity, money, or personal data.
+tier: deep
+claude_model: opus
+codex_model: gpt-5.6-sol
+codex_effort: high
+tools: Read, Grep, Glob, Bash, WebSearch, WebFetch

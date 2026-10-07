@@ -1,0 +1,1528 @@
+#!/usr/bin/env python3
+"""CTO office — build, install, and inspect the AI operating system.
+
+Usage: cto <command> [options]
+
+Commands:
+  build                     generate dist/ from doctrine, experts, coordinators, commands, skills
+  sync [--force] [--claude] [--codex]
+                            install dist/ into ~/.claude and ~/.codex. Only the cto-office block
+                            of CLAUDE.md and AGENTS.md is managed, after a timestamped copy. Skips a
+                            tool that is neither on PATH nor has a home; --claude/--codex force
+                            one. Never adopts a file: one that is not ours and differs is refused.
+                            Refuses to overwrite a managed file you edited; --force does, after
+                            saving a copy beside it
+  status [--claude] [--codex]
+                            report drift, missing, obsolete, and unreadable state; exit 1 unless clean
+  init [DIR]                scaffold a project with a notebook and .os/; exit 1 if git still
+                            ignores the files the office keeps
+  doctor                    check each installed tool, its install targets, and the launcher
+  identities                print the git author identity for every member
+  root                      print the repository root (resolves wherever it was cloned)
+  remove [--yes]            uninstall from this machine (dry run unless --yes)
+  help, -h, --help          print this text; also accepted after any command
+"""
+
+import errno
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+# Resolved once. A symlinked home is a legitimate setup, so every containment and symlink check
+# below is made against the directory the home points at.
+CLAUDE_HOME = (Path.home() / ".claude").resolve()
+CODEX_HOME = (Path.home() / ".codex").resolve()
+LOCAL_BIN = Path.home() / ".local" / "bin"
+MANIFEST = ".os-manifest.json"
+# The global instruction files belong to the user. Only the text between these lines is ours.
+BLOCK_START = "<!-- cto-office:start -->"
+BLOCK_END = "<!-- cto-office:end -->"
+
+# Doctrine inlined into every specialist prompt. Guarantees correct behaviour
+# regardless of what the harness does or does not inherit into a subagent.
+EXPERT_DOCTRINE = ["01-principles.md", "02-protocol.md", "03-project-contract.md"]
+# The global bundle, loaded once per session by both tools.
+GLOBAL_DOCTRINE = ["00-identity.md", "01-principles.md", "02-protocol.md",
+                   "03-project-contract.md", "05-delivery.md"]
+# Coordinators run in the main session, which already has the global bundle.
+COORD_EXTRA = ["04-learning.md"]
+# Coordinator directory -> command name. A coordinator not listed here fails the build.
+COORD_SHORT = {"head-of-engineering": "hoe", "head-of-product": "hop"}
+META_REQUIRED = ["description", "tools", "claude_model", "codex_model", "codex_effort"]
+
+
+def is_junk(name):
+    """OS and editor litter that must never be shipped or claimed."""
+    return name in (".DS_Store", "Thumbs.db", "desktop.ini") or name.startswith("._") \
+        or name.endswith("~")
+
+
+def read(p):
+    return Path(p).read_text(encoding="utf-8")
+
+
+def write(p, text):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+
+
+def warn(msg):
+    print(f"  warning: {msg}", file=sys.stderr)
+
+
+def parse_meta(path):
+    """Minimal flat YAML reader. meta.yaml is scalars only, by design."""
+    meta = {}
+    for line in read(path).splitlines():
+        line = line.split("#")[0].rstrip()
+        if not line or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        meta[key.strip()] = val.strip().strip('"').strip("'")
+    return meta
+
+
+def load_meta(path):
+    """parse_meta, plus the guarantee that every key the build reads is present."""
+    if not Path(path).is_file():
+        raise SystemExit(f"{path}: no meta.yaml for this member")
+    meta = parse_meta(path)
+    missing = [k for k in META_REQUIRED if not meta.get(k)]
+    if missing:
+        raise SystemExit(f"{path}: missing required key(s): {', '.join(missing)}")
+    return meta
+
+
+def short_description(text, limit=60):
+    """Cut at a word boundary so a description never ends mid-word."""
+    if len(text) <= limit:
+        return text
+    if text[limit] == " ":
+        return text[:limit].rstrip()
+    head = text[:limit]
+    return head.rsplit(" ", 1)[0].rstrip(" ,;:-") if " " in head else head
+
+
+def doctrine(names):
+    return "\n\n".join(read(REPO / "doctrine" / n).strip() for n in names)
+
+
+def learned(d):
+    """Return the member's lessons, or None when nothing has been recorded."""
+    p = Path(d) / "LEARNED.md"
+    if not p.exists():
+        return None
+    body = read(p)
+    if "_No lessons recorded yet._" in body:
+        return None
+    return body.strip()
+
+
+def members(kind):
+    root = REPO / kind
+    return sorted(d for d in root.iterdir() if d.is_dir()) if root.exists() else []
+
+
+def inline_doctrine(text, src):
+    """Replace every {{doctrine:<file>}} marker with that doctrine file's body.
+
+    A command that enforces a rule needs the rule, and a second copy of it would drift from the
+    first. The marker keeps one home for the text and one build step that puts it where it is read.
+    """
+    for name in re.findall(r"\{\{doctrine:([^}]+)\}\}", text):
+        path = REPO / "doctrine" / name
+        if not path.exists():
+            raise SystemExit(f"{src}: no doctrine file named {name}")
+        text = text.replace("{{doctrine:" + name + "}}", read(path).strip())
+    return text
+
+
+def strip_frontmatter(text):
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    return text[end + 4:].lstrip("\n") if end != -1 else text
+
+
+# --------------------------------------------------------------------------- build
+
+def build():
+    dist = REPO / "dist"
+    if dist.exists():
+        shutil.rmtree(dist)
+
+    generated = []
+    global_text = doctrine(GLOBAL_DOCTRINE)
+
+    for target in [dist / "claude" / "CLAUDE.md", dist / "codex" / "AGENTS.md"]:
+        write(target, global_text + "\n")
+        generated.append(target)
+
+    schema = read(REPO / "protocols" / "report.schema.json")
+    write(dist / "claude" / "protocols" / "report.schema.json", schema)
+    write(dist / "codex" / "protocols" / "report.schema.json", schema)
+
+    expert_doctrine = doctrine(EXPERT_DOCTRINE)
+
+    for d in members("experts"):
+        meta = load_meta(d / "meta.yaml")
+        slug = meta.get("name", d.name)
+        body = read(d / "EXPERT.md").strip()
+        lessons = learned(d)
+
+        prompt = body + "\n\n---\n\n" + expert_doctrine
+        if lessons:
+            prompt += "\n\n---\n\n" + lessons
+
+        # Claude: frontmatter drives model and tool permissions.
+        claude_fm = (
+            "---\n"
+            f"name: {slug}\n"
+            f"description: {meta['description']}\n"
+            f"tools: {meta['tools']}\n"
+            f"model: {meta['claude_model']}\n"
+            "---\n\n"
+        )
+        p = dist / "claude" / "agents" / f"{slug}.md"
+        write(p, claude_fm + prompt + "\n")
+        generated.append(p)
+
+        # Codex: frontmatter is name/description only; model is chosen per
+        # invocation, so it is documented in the body instead.
+        codex_fm = f"---\nname: {slug}\ndescription: {meta['description']}\n---\n\n"
+        invocation = (
+            f"\n\n---\n\n## Invocation\n\n"
+            f"Model `{meta['codex_model']}`, reasoning effort `{meta['codex_effort']}`.\n"
+        )
+        p = dist / "codex" / "skills" / slug / "SKILL.md"
+        write(p, codex_fm + prompt + invocation)
+        generated.append(p)
+
+        display = slug.replace("-", " ").title()
+        write(dist / "codex" / "skills" / slug / "agents" / "openai.yaml",
+              "interface:\n"
+              f'  display_name: "{display}"\n'
+              f'  short_description: {json.dumps(short_description(meta["description"]), ensure_ascii=False)}\n'
+              f'  default_prompt: "Use ${slug} for this task."\n'
+              "policy:\n"
+              "  allow_implicit_invocation: false\n")
+        generated.append(dist / "codex" / "skills" / slug / "agents" / "openai.yaml")
+
+    coord_extra = doctrine(COORD_EXTRA)
+    roster = read(REPO / "routing" / "roster.md").strip()
+
+    for d in members("coordinators"):
+        slug = d.name
+        short = COORD_SHORT.get(slug)
+        if short is None:
+            raise SystemExit(f"coordinators/{slug}: no command name. Add it to COORD_SHORT in "
+                             f"bin/cto (known: {', '.join(sorted(COORD_SHORT))})")
+        persona = read(d / "PERSONA.md").strip()
+        lessons = learned(d)
+
+        prompt = persona + "\n\n---\n\n" + roster + "\n\n---\n\n" + coord_extra
+        if lessons:
+            prompt += "\n\n---\n\n" + lessons
+
+        desc = f"Enter the {slug.replace('-', ' ').title()} persona"
+        p = dist / "claude" / "commands" / f"{short}.md"
+        write(p, f"---\ndescription: {desc}\n---\n\n" + prompt + "\n")
+        generated.append(p)
+
+        p = dist / "codex" / "prompts" / f"{short}.md"
+        write(p, prompt + "\n")
+        generated.append(p)
+
+    for src in sorted((REPO / "commands").glob("*.md")):
+        text = inline_doctrine(read(src), src)
+        p = dist / "claude" / "commands" / src.name
+        write(p, text)
+        generated.append(p)
+        p = dist / "codex" / "prompts" / src.name
+        write(p, strip_frontmatter(text))
+        generated.append(p)
+
+    expert_slugs = {parse_meta(d / "meta.yaml").get("name", d.name) for d in members("experts")}
+    skills = []
+    for d in members("skills"):
+        if d.name in expert_slugs:
+            raise SystemExit(f"skills/{d.name}: collides with the expert of the same name in "
+                             "dist/codex/skills/")
+        if not (d / "SKILL.md").is_file():
+            raise SystemExit(f"skills/{d.name}: no SKILL.md")
+        for f in sorted(d.rglob("*")):
+            if f.is_symlink():
+                raise SystemExit(f"{f}: symlinks are not copied into skills")
+            if f.is_file() and not is_junk(f.name):
+                for tool in ("claude", "codex"):
+                    p = dist / tool / "skills" / d.name / f.relative_to(d)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, p)
+                    generated.append(p)
+        skills.append(d.name)
+
+    print(f"built {len(generated)} files into dist/")
+    print(f"  experts:      {len(members('experts'))}")
+    print(f"  coordinators: {len(members('coordinators'))}")
+    print(f"  commands:     {len(list((REPO / 'commands').glob('*.md')))}")
+    print(f"  skills:       {len(skills)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------- sync
+#
+# Every mutation inside a tool home goes through a directory file descriptor opened one component
+# at a time with O_NOFOLLOW, so a symlink anywhere below the home fails the syscall instead of
+# being followed. The home itself is resolved once at import; a symlinked ~/.claude is supported.
+#
+# The manifest (format 2) holds one record per path: {"kind": "file"|"block", "hash": sha256}.
+# A path is claimed in the manifest before it is written and its hash is recorded after, so every
+# interrupted state is one the next run reads as claimed-but-absent, claimed-with-old-content, or
+# already-new. A file is ours only if the manifest says so or it matches the new content exactly.
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+ADOPTED_HELP = ("this manifest lists files an older release adopted and backed up as "
+                "<name>.pre-cto-office. This release no longer adopts. For each one, move the "
+                "backup back over the file by hand, then delete the manifest and re-run")
+
+
+class Changed(Exception):
+    """A path differs from what the plan saw. It is skipped, not overwritten."""
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def within(path, root):
+    return path == root or path.startswith(root + os.sep)
+
+
+def tool_of(home):
+    return "claude" if home == CLAUDE_HOME else "codex"
+
+
+def block_rel(home):
+    """The global instruction file in a tool home. Only a marked block of it is ours."""
+    return "CLAUDE.md" if home == CLAUDE_HOME else "AGENTS.md"
+
+
+def pick_homes(argv):
+    """Tool homes to act on: the ones forced by --claude/--codex, else tools on PATH or with a home.
+
+    A home for an absent tool is never created.
+    """
+    forced = [h for flag, h in (("--claude", CLAUDE_HOME), ("--codex", CODEX_HOME)) if flag in argv]
+    if forced:
+        return forced
+    return [h for name, h in (("claude", CLAUDE_HOME), ("codex", CODEX_HOME))
+            if shutil.which(name) or h.exists()]
+
+
+# ---- filesystem access relative to a home
+
+_HOME_FDS = {}
+# Directories this OS created or is about to create in each home, recorded in its manifest before
+# they are made. Only these are pruned.
+_DIRS = {}
+
+
+def home_fd(home):
+    """The tool home as a directory fd, opened once and kept. Every operation starts from it.
+
+    The home was resolved at import, so a symlinked ~/.claude works. A symlink put there since
+    fails the open instead of redirecting every write.
+    """
+    if home not in _HOME_FDS:
+        _HOME_FDS[home] = os.open(str(home), DIR_FLAGS)
+    return _HOME_FDS[home]
+
+
+def open_parent(home, rel, create=False):
+    """fd of the directory holding home/rel. A symlink on the way raises instead of being followed."""
+    fd = os.dup(home_fd(home))
+    try:
+        for part in Path(rel).parts[:-1]:
+            try:
+                nfd = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o755, dir_fd=fd)
+                nfd = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_at(pfd, name):
+    """(bytes, mode) of the regular file `name` in directory pfd, or None when absent."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pfd)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        return fh.read(), stat.S_IMODE(st.st_mode)
+
+
+def missing_dirs(home, rel):
+    """The directories above home/rel that do not exist yet, outermost first."""
+    parts, fd, gone = Path(rel).parts[:-1], os.dup(home_fd(home)), []
+    try:
+        for i, part in enumerate(parts):
+            try:
+                nfd = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                gone = [Path(*parts[:j + 1]).as_posix() for j in range(i, len(parts))]
+                break
+            os.close(fd)
+            fd = nfd
+    finally:
+        os.close(fd)
+    return gone
+
+
+def fs_read(home, rel):
+    """(bytes, mode) of home/rel, None when absent, OSError when a symlink or non-file is in the way."""
+    try:
+        pfd = open_parent(home, rel)
+    except FileNotFoundError:
+        return None
+    try:
+        return read_at(pfd, Path(rel).name)
+    finally:
+        os.close(pfd)
+
+
+def expect(pfd, name, ok):
+    """Raise Changed unless the file now holds a hash in `ok` (None in `ok` means absent)."""
+    if ok is None:
+        return
+    cur = read_at(pfd, name)
+    if (sha(cur[0]) if cur else None) not in ok:
+        raise Changed(f"{name} changed since the plan was made")
+
+
+def fs_write(home, rel, data, mode, ok=None):
+    """Put data at home/rel through a random exclusive temp and a rename in the same directory."""
+    name = Path(rel).name
+    pfd = open_parent(home, rel, create=True)
+    tmp = f".{name}.{uuid.uuid4().hex[:12]}.cto-tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=pfd)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                os.fchmod(fh.fileno(), mode)
+                fh.write(data)
+            expect(pfd, name, ok)
+            os.rename(tmp, name, src_dir_fd=pfd, dst_dir_fd=pfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=pfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(pfd)
+
+
+def fs_unlink(home, rel, ok):
+    pfd = open_parent(home, rel)
+    try:
+        expect(pfd, Path(rel).name, ok)
+        os.unlink(Path(rel).name, dir_fd=pfd)
+    finally:
+        os.close(pfd)
+
+
+def fs_rmdir(home, rel):
+    pfd = open_parent(home, rel)
+    try:
+        os.rmdir(Path(rel).name, dir_fd=pfd)
+    finally:
+        os.close(pfd)
+
+
+BACKUP_KEEP = 5
+
+
+def fs_prune_backups(home, rel):
+    """Delete all but the newest BACKUP_KEEP `<name>.cto-backup-<stamp>` files the office made.
+
+    Only names that match that pattern exactly are touched. Returns the names deleted.
+    """
+    name = Path(rel).name
+    pat = re.compile(re.escape(name) + r"\.cto-backup-(\d{8}-\d{6})(?:-(\d+))?$")
+    pfd = open_parent(home, rel)
+    try:
+        lfd = os.open(".", DIR_FLAGS, dir_fd=pfd)       # its own offset; dup'd fds share one
+        try:
+            names = os.listdir(lfd)
+        finally:
+            os.close(lfd)
+        found = sorted((m.group(1), int(m.group(2) or 1), n)
+                       for n in names for m in [pat.match(n)] if m)
+        gone = [n for _, _, n in found[:-BACKUP_KEEP]]
+        for n in gone:
+            os.unlink(n, dir_fd=pfd)
+        return gone
+    finally:
+        os.close(pfd)
+
+
+def fs_copy_aside(home, rel, kind, stamp, data, mode):
+    """Save data as a new `<name>.<kind>-<stamp>` beside home/rel; the name is taken exclusively."""
+    pfd = open_parent(home, rel)
+    base, n = f"{Path(rel).name}.{kind}-{stamp}", 1
+    try:
+        while True:
+            name = base if n == 1 else f"{base}-{n}"
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                             dir_fd=pfd)
+            except FileExistsError:
+                n += 1
+                continue
+            with os.fdopen(fd, "wb") as fh:
+                os.fchmod(fh.fileno(), mode)
+                fh.write(data)
+            return name
+    finally:
+        os.close(pfd)
+
+
+# ---- the managed block in CLAUDE.md and AGENTS.md
+
+def text_hash(text):
+    return sha(text.encode("utf-8"))
+
+
+def block_split(text):
+    """(before, body, after) around the managed block, or None when there is none.
+
+    Raises ValueError for a start without an end, an end without a start, a second block, or a
+    marker that is not alone on its line.
+    """
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, l in enumerate(lines) if l.strip() == BLOCK_START]
+    ends = [i for i, l in enumerate(lines) if l.strip() == BLOCK_END]
+    if text.count(BLOCK_START) != len(starts) or text.count(BLOCK_END) != len(ends):
+        raise ValueError("a cto-office marker is not alone on its line")
+    if not starts and not ends:
+        return None
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        raise ValueError(f"malformed {BLOCK_START} / {BLOCK_END} markers; need exactly one of each")
+    return ("".join(lines[:starts[0]]), "".join(lines[starts[0] + 1:ends[0]]),
+            "".join(lines[ends[0] + 1:]))
+
+
+def block_put(text, block):
+    """(new text, separator added). The block replaces the old one, or is appended after a blank line.
+
+    The separator is returned so `remove` can take the file back to its exact bytes.
+    """
+    framed = f"{BLOCK_START}\n{block}\n{BLOCK_END}\n"
+    parts = block_split(text)
+    if parts:
+        return parts[0] + framed + parts[2], None
+    sep = "" if not text else ("" if text.endswith("\n") else "\n") + "\n"
+    return text + sep + framed, sep
+
+
+def block_drop(text, sep):
+    before, _, after = block_split(text)
+    if sep and before.endswith(sep):
+        before = before[:-len(sep)]
+    return before + after
+
+
+# ---- the manifest
+
+_HISTORY = {}
+
+
+def history(tool, rel):
+    """sha256 of every committed version of dist/<tool>/<rel>, or None when git cannot say."""
+    key = (tool, rel)
+    if key not in _HISTORY:
+        path, found = f"dist/{tool}/{rel}", None
+        git = shutil.which("git")
+        if git:
+            log = subprocess.run([git, "-C", str(REPO), "log", "--format=%H", "--", path],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if log.returncode == 0:
+                found = set()
+                for rev in log.stdout.decode().split():
+                    shown = subprocess.run([git, "-C", str(REPO), "show", f"{rev}:{path}"],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if shown.returncode == 0:
+                        found.add(sha(shown.stdout))
+        if found is None and "git" not in _HISTORY:
+            _HISTORY["git"] = True
+            warn("cannot read this repository's git history, so files installed by an older "
+                 "release are treated as edited")
+        _HISTORY[key] = found
+    return _HISTORY[key]
+
+
+def pristine(tool, rel, cur, recorded, new):
+    """Is cur (a sha256) what this OS installed? Without a recorded hash, git history decides."""
+    if recorded is not None:
+        return cur == recorded
+    if cur == new:
+        return True
+    seen = history(tool, rel)
+    return seen is not None and cur in seen
+
+
+def entry_problem(rel):
+    """Why a manifest path must not be acted on, or None. The manifest is data read from disk."""
+    if not isinstance(rel, str) or not rel or "\0" in rel:
+        return "not a usable path"
+    if os.path.isabs(rel):
+        return "absolute path"
+    if ".." in rel.split("/"):
+        return "contains .."
+    if rel == "." or rel != os.path.normpath(rel):
+        return "not normalised"
+    if rel == MANIFEST:
+        return "names the manifest itself"
+    return None
+
+
+def read_manifest(home):
+    """{"entries": {rel: {"kind", "hash"[, "sep"]}}, "adopted": [...]}, or None when absent.
+
+    A format-1 manifest (a "files" list) reads as entries without hashes. Entries that fail
+    validation are dropped with a warning and never acted on. Raises ValueError when the file
+    exists but cannot be read.
+    """
+    try:
+        raw = fs_read(home, MANIFEST)
+        m = json.loads(raw[0].decode("utf-8")) if raw else None
+    except (OSError, ValueError) as e:
+        raise ValueError(str(e))
+    if m is None:
+        return None
+    if not isinstance(m, dict):
+        raise ValueError("not a JSON object")
+    # A manifest from before this field existed recorded the repository it was made from.
+    recorded = m.get("launcher", [])
+    for t in (recorded if isinstance(recorded, list) else []):
+        if isinstance(t, str):
+            _LAUNCHERS.add(t)
+    if isinstance(m.get("repo"), str):
+        _LAUNCHERS.add(str(Path(m["repo"]) / "bin" / "cto"))
+    made = m.get("dirs", [])
+    dirs = [d for d in (made if isinstance(made, list) else []) if not entry_problem(d)]
+    _DIRS.setdefault(home, set()).update(dirs)
+    entries = {}
+    if m.get("format") == 2:
+        found = m.get("entries")
+        if not isinstance(found, dict):
+            raise ValueError("entries is not an object")
+        for rel, e in found.items():
+            h = e.get("hash") if isinstance(e, dict) else 0
+            if entry_problem(rel):
+                warn(f"{home / MANIFEST}: ignoring entry {rel!r}: {entry_problem(rel)}")
+            elif not isinstance(e, dict) or e.get("kind") not in ("file", "block") or not (
+                    h is None or (isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h))):
+                warn(f"{home / MANIFEST}: ignoring malformed entry {rel!r}")
+            else:
+                entries[rel] = {k: e[k] for k in ("kind", "hash", "sep") if k in e}
+        return {"entries": entries, "adopted": [], "dirs": dirs}
+    files, adopted = m.get("files", []), m.get("adopted", [])
+    if not isinstance(files, list) or not isinstance(adopted, list):
+        raise ValueError("files or adopted is not a list")
+    for rel in files:
+        if entry_problem(rel):
+            warn(f"{home / MANIFEST}: ignoring entry {rel!r}: {entry_problem(rel)}")
+        else:
+            entries[rel] = {"kind": "file", "hash": None}
+    return {"entries": entries, "adopted": adopted, "dirs": dirs}
+
+
+# Link targets this OS has created, read from every manifest and written back to each one. A link
+# is ours only if it points at this repository's bin/cto or at a target listed here.
+_LAUNCHERS = set()
+
+
+def launcher_target():
+    return str(REPO / "bin" / "cto")
+
+
+def save_manifest(home, entries):
+    data = {"format": 2, "version": read(REPO / "VERSION").strip(), "repo": str(REPO),
+            "launcher": sorted(_LAUNCHERS | {launcher_target()}),
+            "dirs": sorted(_DIRS.get(home, ())),
+            "entries": {rel: entries[rel] for rel in sorted(entries)}}
+    fs_write(home, MANIFEST, (json.dumps(data, indent=2) + "\n").encode("utf-8"), 0o644)
+
+
+def dist_files():
+    """{home: {rel: source}} for every file this OS manages."""
+    dist = REPO / "dist"
+    out = {}
+    for src_root, home in ((dist / "claude", CLAUDE_HOME), (dist / "codex", CODEX_HOME)):
+        out[home] = {}
+        if src_root.exists():
+            for f in sorted(src_root.rglob("*")):
+                if f.is_file() and not is_junk(f.name):
+                    out[home][f.relative_to(src_root).as_posix()] = f
+    return out
+
+
+def unsafe(e):
+    return f"cannot be used safely ({e.strerror or e}); a symlink, a directory, or under one"
+
+
+# ---- plan and apply
+
+def plan_home(home, wanted, force, refused, edited):
+    """Decide what a sync does in one tool home, reading only.
+
+    Appends to `refused` ((path, reason)) and `edited` (path) instead of acting; the caller stops if
+    either is non-empty, so a refusal anywhere means nothing is written anywhere.
+    """
+    tool, brel, mf = tool_of(home), block_rel(home), home / MANIFEST
+    try:
+        man = read_manifest(home) or {"entries": {}, "adopted": []}
+    except ValueError as e:
+        refused.append((mf, f"unreadable ({e}); fix or delete it"))
+        return None
+    if man["adopted"]:
+        refused.append((mf, ADOPTED_HELP))
+        return None
+    ents = man["entries"]
+    plan = {"home": home, "entries": {r: dict(e) for r, e in ents.items()}, "ops": [], "stale": [],
+            "notes": []}
+
+    def read_or_refuse(rel):
+        try:
+            return True, fs_read(home, rel)
+        except OSError as e:
+            refused.append((home / rel, unsafe(e)))
+            return False, None
+
+    for rel, src in wanted.items():
+        dst = home / rel
+        good, cur = read_or_refuse(rel)
+        if not good:
+            continue
+        srcdata = src.read_bytes()
+        seen = sha(cur[0]) if cur else None
+        ent = ents.get(rel)
+        if rel == brel:
+            plan_block(plan, rel, srcdata, cur, seen, ent, force, refused, edited)
+            continue
+        job = {"rel": rel, "kind": "file", "data": srcdata, "seen": seen, "save": None,
+               "mode": stat.S_IMODE(src.stat().st_mode), "hash": sha(srcdata)}
+        if cur is None:
+            plan["ops"].append(job)
+        elif seen == job["hash"]:
+            plan["entries"][rel] = {"kind": "file", "hash": seen}
+        elif ent is None:
+            refused.append((dst, "exists and is not an office file; move it aside and re-run "
+                                 "`cto sync`"))
+        elif pristine(tool, rel, seen, ent["hash"], None):
+            plan["ops"].append(job)
+        elif force:
+            job["save"] = ("cto-edited", cur)
+            plan["ops"].append(job)
+        else:
+            edited.append(dst)
+
+    # Paths a newer release no longer ships. An edited file is kept and forgotten.
+    for rel in sorted(set(ents) - set(wanted)):
+        good, cur = read_or_refuse(rel)
+        if good:
+            seen = sha(cur[0]) if cur else None
+            ent = ents[rel]
+            plan["stale"].append((rel, seen, stale_action(tool, rel, ent, cur, seen), ent, cur))
+    return plan
+
+
+def stale_action(tool, rel, ent, cur, seen):
+    """What to do with a path the release no longer ships: erase, strip (a block), keep, or forget."""
+    if cur is None:
+        return "forget"
+    if ent["kind"] == "file":
+        return "erase" if pristine(tool, rel, seen, ent["hash"], None) else "keep"
+    try:
+        parts = block_split(cur[0].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "keep"
+    if parts is None:
+        return "forget"
+    return "strip" if ent["hash"] and text_hash(parts[1].strip()) == ent["hash"] else "keep"
+
+
+def strip_block(home, rel, cur, sep, stamp):
+    """Take the block out of an instruction file after saving a copy; the rest stays byte for byte.
+
+    Returns True when nothing was left and the file was deleted.
+    """
+    name = fs_copy_aside(home, rel, "cto-backup", stamp, cur[0], cur[1])
+    print(f"  saved {home / rel} -> {name}")
+    rest = block_drop(cur[0].decode("utf-8"), sep)
+    if rest:
+        fs_write(home, rel, rest.encode("utf-8"), cur[1], ok=(sha(cur[0]),))
+        return False
+    fs_unlink(home, rel, ok=(sha(cur[0]),))
+    return True
+
+
+def plan_block(plan, rel, srcdata, cur, seen, ent, force, refused, edited):
+    """Only the marked block of the instruction file is ours; the rest is the user's."""
+    home = plan["home"]
+    dst, block = home / rel, srcdata.decode("utf-8").strip()
+    new = text_hash(block)
+    try:
+        text = cur[0].decode("utf-8") if cur else ""
+        parts = block_split(text)
+    except (ValueError, UnicodeDecodeError) as e:
+        refused.append((dst, str(e)))
+        return
+    rec = ent["hash"] if ent and ent["kind"] == "block" else None
+    sep = ent.get("sep", "") if ent and ent["kind"] == "block" else ""
+    job = {"rel": rel, "kind": "block", "seen": seen, "save": ("cto-backup", cur) if cur else None,
+           "mode": cur[1] if cur else 0o644, "hash": new}
+    legacy = parts is None and cur is not None and ent and (ent["kind"] == "file" or (
+        ent["kind"] == "block" and seen is not None
+        and pristine(tool_of(home), rel, seen, None, sha(srcdata))))
+    if legacy:
+        # Whole-file install of an older release: it becomes a block-only file. The block kind is
+        # claimed first (also on a re-run after an interruption), so both sides of the write are removable.
+        if not (pristine(tool_of(home), rel, seen, ent["hash"] if ent["kind"] == "file" else None,
+                         sha(srcdata)) or force):
+            edited.append(dst)
+            return
+        text = ""
+        job["claim"] = {"kind": "block", "hash": new}
+    elif parts is not None:
+        body = text_hash(parts[1].strip())
+        if body == new:
+            plan["entries"][rel] = dict({"kind": "block", "hash": new}, **({"sep": sep} if sep else {}))
+            note_user_text(plan, dst, text)
+            return
+        if not (body == rec or force):
+            edited.append(dst)
+            return
+    new_text, added = block_put(text, block)
+    job["data"], job["sep"] = new_text.encode("utf-8"), added if added is not None else sep
+    if ent and ent["kind"] == "file":
+        job["claim"] = {"kind": "block", "hash": new}
+    if added:
+        # The separator is claimed with the path, so an interruption cannot lose how to undo it.
+        job["claim"] = {"kind": "block", "hash": new if rec is None else rec, "sep": added}
+    plan["ops"].append(job)
+    note_user_text(plan, dst, new_text)
+
+
+def note_user_text(plan, dst, text):
+    before, _, after = block_split(text)
+    if (before + after).strip():
+        plan["notes"].append(dst)
+
+
+def apply_home(plan, stamp, skipped, kept):
+    """Carry out one home's plan: claim, write, record; then stale paths. Returns files written."""
+    home, ents, written = plan["home"], plan["entries"], 0
+
+    def record(rel, entry):
+        ents[rel] = entry
+        save_manifest(home, ents)
+
+    for op in plan["ops"]:
+        # Directories are claimed before they are created, so none can exist unrecorded.
+        _DIRS.setdefault(home, set()).update(missing_dirs(home, op["rel"]))
+    for op in plan["ops"]:
+        if op.get("claim"):
+            ents[op["rel"]] = op["claim"]
+        else:
+            ents.setdefault(op["rel"], {"kind": op["kind"], "hash": op["hash"]})
+    save_manifest(home, ents)
+    for op in plan["ops"]:
+        rel = op["rel"]
+        try:
+            if op["save"]:
+                kind, (data, mode) = op["save"]
+                name = fs_copy_aside(home, rel, kind, stamp, data, mode)
+                print(f"  saved your {home / rel} -> {name}")
+            fs_write(home, rel, op["data"], op["mode"], ok=(op["seen"],))
+            if op["kind"] == "block":
+                gone = fs_prune_backups(home, rel)
+                if gone:
+                    print(f"  deleted {len(gone)} older backup(s) of {home / rel}; the {BACKUP_KEEP} "
+                          f"newest <name>.cto-backup-<YYYYmmdd-HHMMSS> files are kept")
+        except Changed as e:
+            skipped.append((home / rel, str(e)))
+            continue
+        entry = {"kind": op["kind"], "hash": op["hash"]}
+        if op.get("sep"):
+            entry["sep"] = op["sep"]
+        record(rel, entry)
+        written += 1
+    for rel, seen, action, ent, cur in plan["stale"]:
+        try:
+            if action == "erase":
+                fs_unlink(home, rel, ok=(seen,))
+                print(f"  removed stale {home / rel}")
+            elif action == "strip":
+                strip_block(home, rel, cur, ent.get("sep", ""), stamp)
+                print(f"  removed the stale cto-office block from {home / rel}")
+            elif action == "keep":
+                kept.append(home / rel)
+        except Changed as e:
+            skipped.append((home / rel, str(e)))
+            continue
+        except FileNotFoundError:
+            pass
+        ents.pop(rel)
+        save_manifest(home, ents)
+    return written
+
+
+def sync(argv):
+    force = "--force" in argv
+    for a in argv:
+        if a not in ("--force", "--claude", "--codex"):
+            print(f"unknown option: {a}\n{__doc__}", file=sys.stderr)
+            return 1
+    homes = pick_homes(argv)
+    if not homes:
+        print("neither claude nor codex is on PATH and neither ~/.claude nor ~/.codex exists; "
+              "install one, or force a target with --claude or --codex", file=sys.stderr)
+        return 1
+    if not (REPO / "dist").exists():
+        print("no dist/ — run `cto build` first", file=sys.stderr)
+        return 1
+
+    for h in (CLAUDE_HOME, CODEX_HOME):    # read only: which link targets this OS has created
+        try:
+            read_manifest(h)
+        except ValueError:
+            pass
+    wanted = dist_files()
+    refused, edited = [], []
+    plans = [plan_home(h, wanted[h], force, refused, edited) for h in homes]
+    if refused or edited:
+        if refused:
+            print("refused; nothing was written:", file=sys.stderr)
+            for path, why in refused:
+                print(f"  {path}: {why}", file=sys.stderr)
+        if edited:
+            print("edited since the last sync; not overwritten:", file=sys.stderr)
+            for path in edited:
+                print(f"  {path}", file=sys.stderr)
+            print("`cto sync --force` overwrites them, after saving a copy beside each as "
+                  "<name>.cto-edited-<timestamp>", file=sys.stderr)
+        return 1
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    skipped, kept, written = [], [], 0
+    try:
+        for home in homes:
+            home.mkdir(parents=True, exist_ok=True)
+        for plan in plans:
+            written += apply_home(plan, stamp, skipped, kept)
+    except OSError as e:
+        print(f"sync stopped: {e}\nre-run `cto sync` to finish", file=sys.stderr)
+        return 1
+
+    try:
+        link_launcher()
+    except OSError as e:
+        print(f"synced the files, but linking {LOCAL_BIN / 'cto'} failed: {e}. Everything installed is "
+              f"consistent; fix the cause and re-run `cto sync`.", file=sys.stderr)
+        return 1
+
+    print(f"synced {sum(len(wanted[h]) for h in homes)} files ({written} written)")
+    for home in homes:
+        print(f"  {home}")
+    for path in kept:
+        print(f"kept your edited {path}; it is no longer managed")
+    for plan in plans:
+        for dst in plan["notes"]:
+            print(f"note: {dst} also has your own instructions outside the cto-office block; "
+                  "both sets are now in force")
+    print("\nRestart Claude Code and start a new Codex session to pick up changes.")
+    if skipped:
+        print("\nskipped; these changed while sync was running. Re-run `cto sync`:", file=sys.stderr)
+        for path, why in skipped:
+            print(f"  {path}: {why}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def is_office_launcher(link):
+    """True when the symlink points at this repository's bin/cto or at a target a manifest records.
+
+    A path that merely ends in bin/cto proves nothing, so anything else is left alone, dangling or not.
+    """
+    try:
+        raw = os.readlink(link)
+    except OSError:
+        return False
+    return raw == launcher_target() or raw in _LAUNCHERS or \
+        os.path.normpath(os.path.join(os.path.dirname(link), raw)) == launcher_target()
+
+
+def foreign_launcher(link):
+    print(f"  {link} points at {os.readlink(link)}, which this office did not create; leaving it. "
+          f"To replace it yourself: ln -sfn {launcher_target()} {link}")
+
+
+def link_launcher():
+    """Symlink ~/.local/bin/cto at the repo, so `git pull` updates the command too."""
+    link, target = LOCAL_BIN / "cto", REPO / "bin" / "cto"
+    if link.is_symlink():
+        if os.readlink(link) == str(target):
+            return
+        if not is_office_launcher(link):
+            foreign_launcher(link)
+            return
+        link.unlink()
+    elif os.path.lexists(link):
+        print(f"  {link} exists and is not a symlink — leaving it alone")
+        return
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    print(f"  linked {link} -> {target}")
+
+
+# -------------------------------------------------------------------------- status
+
+def peek(home, rel):
+    """File bytes, or None when absent or not safely readable."""
+    try:
+        got = fs_read(home, rel)
+    except OSError:
+        return None
+    return got[0] if got else None
+
+
+def status(argv):
+    if not (REPO / "dist").exists():
+        print("no dist/ — run `cto build` first", file=sys.stderr)
+        return 1
+
+    missing, stale, obsolete, broken, foreign, ok = [], [], [], [], [], 0
+    wanted = dist_files()
+    for home in pick_homes(argv):
+        files = wanted[home]
+        try:
+            man = read_manifest(home)
+        except ValueError as e:
+            man = None
+            broken.append(f"{home / MANIFEST} is unreadable ({e})")
+        ours = man["entries"] if man else (None if broken else {})
+        ok_before = ok
+        for rel, src in files.items():
+            dst, cur, srcdata = home / rel, peek(home, rel), src.read_bytes()
+            if cur is not None and rel == block_rel(home):
+                try:
+                    parts = block_split(cur.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    parts = None
+                cur = parts[1].strip().encode("utf-8") if parts else None
+                srcdata = srcdata.decode("utf-8").strip().encode("utf-8")
+            if cur is None:
+                missing.append(dst)
+            elif cur != srcdata:
+                (foreign if ours is not None and rel not in ours and rel != block_rel(home)
+                 else stale).append(dst)
+            else:
+                ok += 1
+        if man is None and not broken and ok > ok_before:
+            broken.append(f"{home / MANIFEST} is missing, but office files are installed here, so "
+                          "ownership is unrecorded; `cto sync` rebuilds the record")
+        for rel in (ours or {}):
+            if rel not in files:
+                obsolete.append(f"{home / rel}" + ("" if peek(home, rel) is not None
+                                                    else " (already gone; the manifest still lists it)"))
+
+    print(f"in sync:  {ok}")
+    for label, items in (("missing", missing), ("drifted", stale), ("obsolete", obsolete),
+                         ("broken", broken), ("foreign", foreign)):
+        if items:
+            print(f"{label + ':':9} {len(items)}")
+            for p in items[:10]:
+                print(f"  {p}")
+    if foreign:
+        print("\nforeign files exist, differ, and are not ours; sync refuses them. Move each aside "
+              "and re-run `cto sync`")
+    if not (missing or stale or obsolete or broken or foreign):
+        print("\nclean.")
+        return 0
+    if missing or stale or obsolete or broken:
+        print("\nrun `cto sync`")
+    return 1
+
+
+# ---------------------------------------------------------------------------- init
+
+WHOLE_DIR_RULES = {".os", ".os/", "/.os", "/.os/"}
+GITIGNORE_KEEP = ["!.os/state.md", "!.os/verify-*.sh"]
+KEPT_OS_FILES = [".os/state.md", ".os/verify-state.sh", ".os/verify-mutation.sh"]
+
+
+def reconcile_gitignore(text, snippet):
+    """The .gitignore text with .os/* ignored and the two exceptions after it.
+
+    A whole-directory rule cannot be undone by a later exception, so it becomes `.os/*`.
+    """
+    lines = text.splitlines()
+    last = None
+    for i, line in enumerate(lines):
+        if line.strip() in WHOLE_DIR_RULES:
+            lines[i] = ".os/*"
+        if line.strip() in WHOLE_DIR_RULES or line.strip() == ".os/*":
+            last = i
+    if last is None:
+        return text + ("" if not text or text.endswith("\n") else "\n") + snippet
+    after = {line.strip() for line in lines[last + 1:]}
+    lines[last + 1:last + 1] = [k for k in GITIGNORE_KEEP if k not in after]
+    return "\n".join(lines) + "\n"
+
+
+def escapes_target(path, target):
+    """Why init must not write at path, or None. Every path is checked before any is written."""
+    if path.is_symlink() and not path.exists():
+        return "is a dangling symlink"
+    real = os.path.realpath(path)
+    if os.path.lexists(path) and not within(real, str(target)):
+        return f"resolves to {real}, outside {target}"
+    return None
+
+
+def warn_if_ignored(target):
+    """In a git repository, shout when the kept .os files are still ignored. True if any are."""
+    if not shutil.which("git"):
+        return False
+    def git(*args):
+        return subprocess.run(["git", "-C", str(target)] + list(args), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, universal_newlines=True)
+    inside = git("rev-parse", "--is-inside-work-tree")
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return False
+    ignored = []
+    for rel in KEPT_OS_FILES:
+        r = git("check-ignore", "-q", "--", rel)
+        if r.returncode == 0:
+            why = git("check-ignore", "-v", "--", rel).stdout.strip()
+            ignored.append((rel, why))
+        elif r.returncode != 1:
+            print(f"\nwarning: `git check-ignore {rel}` failed: {r.stderr.strip()}")
+    if ignored:
+        print("\n!! WARNING: git still ignores files the office needs committed:")
+        for rel, why in ignored:
+            print(f"!!   {rel}   ({why})")
+        print("!! `git add` will skip them silently and the gates will run nowhere.")
+        print("!! Fix the rule above in .gitignore (or a parent or global ignore file).")
+    return bool(ignored)
+
+
+def init(argv):
+    target = Path(argv[0]).resolve() if argv else Path.cwd().resolve()
+    if not target.is_dir():
+        print(f"not a directory: {target}", file=sys.stderr)
+        return 1
+
+    planned = [target / "AGENTS.md", target / ".gitignore", target / ".os",
+               target / ".os" / "state.md", target / ".os" / "verify-state.sh",
+               target / ".os" / "verify-mutation.sh"]
+    refused = [(p, why) for p in planned for why in [escapes_target(p, target)] if why]
+    if refused:
+        print("refused; nothing was written:", file=sys.stderr)
+        for p, why in refused:
+            print(f"  {p.relative_to(target)} {why}", file=sys.stderr)
+        return 1
+
+    created, skipped, updated = [], [], []
+
+    notebook = target / "AGENTS.md"
+    if notebook.exists():
+        skipped.append(notebook)
+    else:
+        tmpl = read(REPO / "templates" / "AGENTS.md.tmpl")
+        write(notebook, tmpl.replace("{{PROJECT}}", target.name))
+        created.append(notebook)
+
+    state = target / ".os" / "state.md"
+    if state.exists():
+        skipped.append(state)
+    else:
+        write(state, read(REPO / "templates" / "os-state.md.tmpl"))
+        created.append(state)
+
+    # The office exempts .os/state.md from review, so it ships the check for the gap that opens.
+    verify = target / ".os" / "verify-state.sh"
+    if verify.exists():
+        skipped.append(verify)
+    else:
+        write(verify, read(REPO / "templates" / "os-verify-state.sh"))
+        verify.chmod(0o755)
+        created.append(verify)
+
+    # A gate nobody has broken is decoration, and a passing gate is indistinguishable from one
+    # that had nothing to check. This is how a project settles that for a given line.
+    mutation = target / ".os" / "verify-mutation.sh"
+    if mutation.exists():
+        skipped.append(mutation)
+    else:
+        write(mutation, read(REPO / "templates" / "os-verify-mutation.sh"))
+        mutation.chmod(0o755)
+        created.append(mutation)
+
+    gi = target / ".gitignore"
+    snippet = read(REPO / "templates" / "gitignore-snippet")
+    if gi.exists():
+        text = read(gi)
+        fixed = reconcile_gitignore(text, snippet)
+        if fixed != text:
+            write(gi, fixed)
+            (created if ".os/*" not in text and not any(
+                l.strip() in WHOLE_DIR_RULES for l in text.splitlines()) else updated).append(gi)
+        else:
+            skipped.append(gi)
+    else:
+        write(gi, snippet.lstrip("\n"))
+        created.append(gi)
+
+    for p in created:
+        print(f"  created  {p.relative_to(target)}")
+    for p in updated:
+        print(f"  updated  {p.relative_to(target)}  (.os/ is ignored except state.md and verify-*.sh)")
+    for p in skipped:
+        print(f"  kept     {p.relative_to(target)}")
+
+    # Report what context already exists, so the notebook can point at it.
+    found = [n for n in ("README.md", "docs", "doc") if (target / n).exists()]
+    print(f"\nexisting context: {', '.join(found) if found else 'none found'}")
+    print("Fill in AGENTS.md. Long-form knowledge belongs in docs/, not there.")
+
+    if verify in created:
+        print(f"""
+`.os/verify-state.sh` checks that .os/state.md still matches reality: every pull request it
+names is open, every open pull request is named, and every backticked name containing a slash
+exists as a repository path or a branch, local or on the remote. Run it now with
+`./.os/verify-state.sh`.
+
+Nothing runs it for you. Wire it into CI, or it is decoration that looks like coverage.
+Every project's CI differs, so this part is yours. On GitHub Actions, add a step to a job you
+already have rather than a new one, since it needs no database:
+
+      permissions:
+        contents: read
+        pull-requests: read        # gh's PR queries need this; checkout alone is not enough
+      steps:
+        - name: Verify working state matches reality
+          env:
+            GITHUB_PR_NUMBER: ${{{{ github.event.pull_request.number }}}}
+            GH_TOKEN: ${{{{ github.token }}}}
+          run: ./.os/verify-state.sh
+
+GITHUB_PR_NUMBER lets the check pass on the pull request that introduces it, which cannot yet
+name itself in a file it may not touch. An unrelated unnamed pull request still fails the build.
+
+`./.os/verify-state.sh --write` regenerates the fenced open-pull-request list in .os/state.md from
+GitHub. Run it after opening or merging one, or on a schedule against the default branch, so the
+check finds the file already current instead of failing to tell you it is not.
+
+This instruction is repeated in AGENTS.md so it outlives this terminal output.""")
+
+    if mutation in created:
+        print("""
+`.os/verify-mutation.sh` settles whether a gate would actually notice a change. It breaks one
+line, runs the gates you name, and fails unless one of them failed:
+
+      ./.os/verify-mutation.sh --file <path> --delete-line '<pattern>' --gate '<command>'
+
+`--gate` is required and takes the command you would type yourself, because nothing shipped by
+the office knows what your gates are called. Exit 0 means a gate caught it, 1 means none did,
+and 3 means the mutation matched nothing and the run proved nothing — which is the case that
+otherwise reads exactly like proof.
+
+Nothing wires this into CI, and nothing should. The mutation is the argument.""")
+
+    return 1 if warn_if_ignored(target) else 0
+
+
+# -------------------------------------------------------------------------- doctor
+
+def doctor():
+    problems = 0
+
+    print("toolchains and install targets")
+    skills = [d.name for d in members("skills")]
+    targets = {"claude": ["CLAUDE.md", "agents", "commands", "protocols"] + (["skills"] if skills else []),
+               "codex": ["AGENTS.md", "skills", "prompts", "protocols"]}
+    for name, home in (("claude", CLAUDE_HOME), ("codex", CODEX_HOME)):
+        path = shutil.which(name)
+        installed = os.path.lexists(home / MANIFEST)
+        if not path and not installed:
+            print(f"  skip  {name:8} not on PATH and no office install; not needed")
+            continue
+        if path:
+            ver = os.popen(f"{name} --version 2>/dev/null").read().strip().splitlines()
+            print(f"  ok    {name:8} {ver[0] if ver else '?'}  ({path})")
+        else:
+            print(f"  MISS  {name:8} not on PATH, but {home} has an office install")
+            problems += 1
+        for t in targets[name]:
+            p = home / t
+            if p.exists():
+                n = len(list(p.iterdir())) if p.is_dir() else 1
+                print(f"  ok    {p}  ({n} item{'s' if n != 1 else ''})")
+            else:
+                print(f"  MISS  {p}")
+                problems += 1
+
+    print("\nrequirements")
+    if shutil.which("git"):
+        print(f"  ok    git      ({shutil.which('git')})")
+    else:
+        print("  MISS  git      not on PATH; `cto sync` cannot read history to recognise older installs")
+        problems += 1
+    if not shutil.which("gh"):
+        print("  warning  gh not on PATH; only /pr and .os/verify-state.sh need it")
+    elif subprocess.run(["gh", "auth", "status"], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL).returncode != 0:
+        print("  warning  gh is not authenticated; run `gh auth login` for /pr and .os/verify-state.sh")
+    else:
+        print(f"  ok    gh       authenticated ({shutil.which('gh')})")
+
+    print("\nlauncher")
+    on_path = shutil.which("cto")
+    link = LOCAL_BIN / "cto"
+    if on_path:
+        print(f"  ok    cto on PATH ({on_path})")
+    elif link.exists():
+        print(f"  MISS  {link} exists but {LOCAL_BIN} is not on PATH")
+        print(f"        add:  export PATH=\"$HOME/.local/bin:$PATH\"")
+        problems += 1
+    else:
+        print(f"  MISS  no launcher — run `cto sync`")
+        problems += 1
+
+    print("\nroster")
+    print(f"  {len(members('experts'))} experts, {len(members('coordinators'))} coordinators")
+
+    notes = REPO / ".notes"
+    queued = len(list(notes.glob("*.md"))) if notes.exists() else 0
+    print(f"  {queued} member(s) with queued notes — run /1on1 to consolidate"
+          if queued else "  no queued notes")
+    if (CLAUDE_HOME / "os-notes").exists():
+        print(f"  hint: {CLAUDE_HOME / 'os-notes'} holds notes from an older release; move its "
+              f"*.md files into {notes}/ yourself")
+
+    print(f"\n{'problems found' if problems else 'healthy'}")
+    return 1 if problems else 0
+
+
+def remove(argv):
+    """Uninstall from the two tool homes and the launcher.
+
+    The manifests are the only authority for what to delete — never glob a
+    directory. A file is deleted only if it still holds the content this OS
+    wrote; an edited one is kept and reported. The global instruction files
+    lose only their marked block, after a timestamped copy. Projects are never
+    touched: their AGENTS.md and .os/ belong to them, not to this OS.
+    """
+    apply = "--yes" in argv
+    jobs, mans, left, kept = [], {}, [], []
+
+    for home in (CLAUDE_HOME, CODEX_HOME):
+        if not os.path.lexists(home / MANIFEST):
+            continue
+        try:
+            man = read_manifest(home)
+        except ValueError as e:
+            left.append((home / MANIFEST, f"unreadable ({e}); skipping {home} for safety"))
+            continue
+        if man["adopted"]:
+            left.append((home / MANIFEST, ADOPTED_HELP))
+            continue
+        tool, mans[home] = tool_of(home), man["entries"]
+        for rel, ent in man["entries"].items():
+            try:
+                cur = fs_read(home, rel)
+            except OSError as e:
+                left.append((home / rel, unsafe(e)))
+                continue
+            if cur is None:
+                jobs.append((home, rel, ent, "gone", None))
+                continue
+            seen = sha(cur[0])
+            if ent["kind"] == "block":
+                try:
+                    parts = block_split(cur[0].decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as e:
+                    left.append((home / rel, str(e)))
+                    continue
+                src = REPO / "dist" / tool / rel
+                whole = (parts is None and src.is_file()
+                         and pristine(tool, rel, seen, None, sha(src.read_bytes())))
+                jobs.append((home, rel, ent, "block" if parts else "delete" if whole else "gone", cur))
+            else:
+                src = REPO / "dist" / tool / rel
+                new = sha(src.read_bytes()) if src.is_file() else None
+                same = pristine(tool, rel, seen, ent["hash"], new)
+                jobs.append((home, rel, ent, "delete" if same else "keep", cur))
+
+    link = LOCAL_BIN / "cto"
+    launcher = link if link.is_symlink() and is_office_launcher(link) else None
+    if link.is_symlink() and not launcher:
+        foreign_launcher(link)
+
+    if not mans and not launcher and not left:
+        print("nothing installed — nothing to remove")
+        return 0
+
+    verb = "removing" if apply else "would remove"
+    print(f"{verb}:")
+    for home in (CLAUDE_HOME, CODEX_HOME):
+        n = sum(1 for j in jobs if j[0] == home and j[3] == "delete")
+        if n:
+            print(f"  {home}  ({n} file(s))")
+    for home, rel, _, what, _ in jobs:
+        if what == "block":
+            print(f"  the cto-office block in {home / rel} (the rest of the file stays; a copy is saved)")
+        elif what == "keep":
+            print(f"  keeping {home / rel}: you edited it")
+    if launcher:
+        print(f"  {link} -> {link.resolve()}")
+
+    notes = REPO / ".notes"
+    queued = sorted(notes.glob("*.md")) if notes.exists() else []
+    if queued:
+        print(f"\nkeeping {len(queued)} queued 1:1 note file(s) in {notes}")
+        print("  these are your notes, not generated — delete them yourself if you want them gone")
+    print(f"\nNot touched: this repository, and any project's AGENTS.md or .os/ directory.")
+
+    if not apply:
+        for p, why in left:
+            print(f"  would be left in place: {p}: {why}")
+        print("\ndry run — re-run with `cto remove --yes` to apply")
+        return 1 if left else 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    removed = []
+    for home, rel, ent, what, cur in jobs:
+        ents = mans[home]
+        try:
+            if what == "delete":
+                fs_unlink(home, rel, ok=(sha(cur[0]),))
+                removed.append(home / rel)
+            elif what == "keep":
+                kept.append(home / rel)
+            elif what == "block":
+                if strip_block(home, rel, cur, ent.get("sep", ""), stamp):
+                    removed.append(home / rel)
+        except (OSError, Changed) as e:
+            left.append((home / rel, str(e)))
+            continue
+        del ents[rel]
+        try:
+            save_manifest(home, ents)
+        except OSError as e:
+            left.append((home / MANIFEST, str(e)))
+    if launcher:
+        try:
+            link.unlink()
+        except OSError as e:
+            left.append((link, str(e)))
+    # Prune only directories this OS created (recorded in the manifest), deepest first, only when
+    # empty. A directory that was already there, such as ~/.claude/skills, is never touched.
+    for home in (CLAUDE_HOME, CODEX_HOME):
+        for d in sorted(_DIRS.get(home, ()), key=lambda p: len(Path(p).parts), reverse=True):
+            try:
+                fs_rmdir(home, d)
+            except OSError:
+                pass
+
+    # The manifest is the record of what is still ours. It goes last: after the files and after the
+    # directories it names, so an interruption anywhere leaves a manifest the next remove can finish.
+    for home, ents in mans.items():
+        if not ents:
+            try:
+                fs_unlink(home, MANIFEST, ok=None)
+                removed.append(home / MANIFEST)
+            except OSError as e:
+                left.append((home / MANIFEST, str(e)))
+
+    for p in kept:
+        print(f"kept {p}: you edited it, so it is yours now")
+    if left:
+        print(f"\nNOT fully removed. {len(left)} item(s) left in place:", file=sys.stderr)
+        for p, why in left:
+            print(f"  {p}: {why}", file=sys.stderr)
+        print("Fix the above and re-run `cto remove --yes`.", file=sys.stderr)
+        return 1
+
+    print("\nremoved. Restart Claude Code and start a new Codex session.")
+    print(f"The repository is untouched at {REPO} — `cto sync` reinstalls.")
+    return 0
+
+
+def root():
+    """Where this OS lives. Never hardcode a path — ask for it."""
+    print(REPO)
+    return 0
+
+
+def identities():
+    """Git author identity for each member. Derived, never stored."""
+    print(f"{'slug':22} git author")
+    for kind in ("coordinators", "experts"):
+        for d in members(kind):
+            slug = d.name
+            display = slug.replace("-", " ").title()
+            print(f"{slug:22} {display} <{slug}@cto-office.invalid>")
+    print("\nThe specialist is the author; you are the committer.")
+    print("`.invalid` is reserved (RFC 2606) — these never link to a GitHub account.")
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 1
+    cmd, argv = sys.argv[1], sys.argv[2:]
+    if cmd in ("help", "-h", "--help") or any(a in ("-h", "--help") for a in argv):
+        print(__doc__)
+        return 0
+    fns = {"build": build, "doctor": doctor, "identities": identities, "root": root}
+    if cmd == "init":
+        return init(argv)
+    if cmd == "remove":
+        return remove(argv)
+    if cmd == "sync":
+        return sync(argv)
+    if cmd == "status":
+        return status(argv)
+    if cmd in fns:
+        return fns[cmd]()
+    print(f"unknown command: {cmd}\n{__doc__}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

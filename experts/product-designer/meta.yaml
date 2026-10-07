@@ -1,0 +1,7 @@
+name: product-designer
+description: User flows, information architecture, interaction design, design systems, and usability. Use when deciding how something should work for the person using it.
+tier: deep
+claude_model: opus
+codex_model: gpt-5.6-sol
+codex_effort: high
+tools: Read, Grep, Glob, Bash, WebSearch, WebFetch

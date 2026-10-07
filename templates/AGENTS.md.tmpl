@@ -1,0 +1,67 @@
+# {{PROJECT}}
+
+<!--
+  This is the project notebook. Both Claude Code and Codex read it automatically.
+  It holds project truth. Keep it short and current — long-form knowledge goes in docs/.
+-->
+
+## What this is
+
+_One paragraph: what this project is and who it is for._
+
+## Governing sources
+
+_Where the real specification lives. Links, documents, decision records._
+
+- README.md — how to run it
+- docs/ — knowledge base
+
+## Stack
+
+_Languages, frameworks, datastores, services. What runs where._
+
+## Conventions
+
+_Anything an engineer joining today would get wrong. Patterns in use, naming, structure,
+what is deliberately not done here._
+
+**An assertion is proven by breaking what it guards and watching it fail.** One nobody has broken
+is decoration, and a gate that passes reads the same as a gate that had nothing to check.
+`./.os/verify-mutation.sh --file <path> --delete-line '<pattern>' --gate '<command>'` is that break
+as a command: it applies the mutation, runs the gates, restores the file, and fails unless a gate
+failed. Exit 3 means the mutation matched nothing, so the run proved nothing.
+
+## Commands
+
+_How to build, test, run, and deploy._
+
+## Current state
+
+See `.os/state.md`. That file goes straight to the default branch without review, so
+`.os/verify-state.sh` is what keeps it honest: it asserts that every pull request named there is
+open, every open pull request is named, and every backticked name containing a slash exists as a
+repository path or a branch, local or on the remote.
+
+Run it in CI or it provides nothing. Add a step to a job that already exists:
+
+```yaml
+    permissions:
+      contents: read
+      pull-requests: read        # gh's PR queries need this; checkout alone is not enough
+    steps:
+      - name: Verify working state matches reality
+        env:
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: ./.os/verify-state.sh
+```
+
+`GITHUB_PR_NUMBER` lets the check pass on the pull request that introduces it, which cannot yet
+name itself in a file it may not touch. An unrelated unnamed pull request still fails the build.
+
+`./.os/verify-state.sh --write` regenerates the fenced open-pull-request list in `.os/state.md`
+from GitHub. Run it after opening or merging one, or on a schedule against the default branch.
+
+## Decisions
+
+_Where decisions are recorded._

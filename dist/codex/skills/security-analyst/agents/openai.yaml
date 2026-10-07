@@ -1,0 +1,6 @@
+interface:
+  display_name: "Security Analyst"
+  short_description: "Threat modelling, authentication and authorization, secrets"
+  default_prompt: "Use $security-analyst for this task."
+policy:
+  allow_implicit_invocation: false

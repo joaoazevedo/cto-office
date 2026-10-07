@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"
+          - os: ubuntu-latest
+            python: "3.x"
+          - os: macos-latest
+            python: "3.x"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: dist/ matches a fresh build
+        run: |
+          python3 bin/cto build
+          git status --porcelain -- dist
+          test -z "$(git status --porcelain -- dist)"
+      - name: bin/cto
+        run: tests/run-cto.sh
+      - name: gate scripts
+        # macOS ships bash 3.2 as /bin/bash; the scripts must keep working there too.
+        run: |
+          set -- /bin/bash
+          other=$(command -v bash)
+          [ "$(realpath "$other")" = "$(realpath /bin/bash)" ] || set -- "$@" "$other"
+          tests/run-gates.sh "$@"

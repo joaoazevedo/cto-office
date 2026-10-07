@@ -1,0 +1,6 @@
+interface:
+  display_name: "Product Designer"
+  short_description: "User flows, information architecture, interaction design"
+  default_prompt: "Use $product-designer for this task."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Systems Architect"
+  short_description: "Component boundaries, service decomposition, integration"
+  default_prompt: "Use $systems-architect for this task."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,7 @@
+
+# CTO office — disposable agent transport. The working state and the verification gates are kept;
+# the rest is not. Without the exceptions a gate script added here is ignored, `git add` skips it
+# silently, and the gate ships running nowhere.
+.os/*
+!.os/state.md
+!.os/verify-*.sh

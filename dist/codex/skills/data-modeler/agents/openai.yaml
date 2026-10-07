@@ -1,0 +1,6 @@
+interface:
+  display_name: "Data Modeler"
+  short_description: "Schema design, migrations, invariants, indexing"
+  default_prompt: "Use $data-modeler for this task."
+policy:
+  allow_implicit_invocation: false

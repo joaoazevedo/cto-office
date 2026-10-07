@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CTO Office specialist report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "confidence", "findings", "recommendation", "evidence_bar", "open", "not_covered"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "description": "One line. The answer itself, not a description of the answer."
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"]
+    },
+    "findings": {
+      "type": "array",
+      "description": "Empty array when there is nothing to report. Never invent a finding.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["priority", "claim", "location", "why"],
+        "properties": {
+          "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
+          "claim": { "type": "string" },
+          "location": {
+            "type": ["string", "null"],
+            "description": "file:line, or null when not about existing code."
+          },
+          "why": { "type": "string", "description": "One sentence on why it matters." }
+        }
+      }
+    },
+    "recommendation": {
+      "type": "array",
+      "maxItems": 5,
+      "items": { "type": "string", "description": "Imperative." }
+    },
+    "evidence_bar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "justification"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["capability", "constraint", "security", "operating-benefit", "none-proposed"]
+        },
+        "justification": {
+          "type": "string",
+          "description": "What justifies any new table, service, datastore, dependency, or operational surface."
+        }
+      }
+    },
+    "open": {
+      "type": "array",
+      "description": "Questions needing a human decision. Empty when none. Never fill an unknown with a guess.",
+      "items": { "type": "string" }
+    },
+    "not_covered": {
+      "type": ["string", "null"],
+      "description": "Anything in scope that was not examined, or null."
+    }
+  }
+}

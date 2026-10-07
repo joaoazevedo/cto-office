@@ -1,0 +1,6 @@
+interface:
+  display_name: "Critic"
+  short_description: "Red-teams a plan, design, or decision before it is committed"
+  default_prompt: "Use $critic for this task."
+policy:
+  allow_implicit_invocation: false

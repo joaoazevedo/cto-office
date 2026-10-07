@@ -1,0 +1,6 @@
+interface:
+  display_name: "Qa Engineer"
+  short_description: "Test strategy, test authoring, regression risk, coverage"
+  default_prompt: "Use $qa-engineer for this task."
+policy:
+  allow_implicit_invocation: false
